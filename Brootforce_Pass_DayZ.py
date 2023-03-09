@@ -5,7 +5,8 @@ import pyautogui as py
 
 
 def rnd_sleep(x, y):
-    random.uniform(x, y)
+    sleep = random.uniform(x, y)
+    t.sleep(sleep)
 
 
 # крутит число
