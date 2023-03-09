@@ -7,6 +7,7 @@ import pyautogui as py
 def rnd_sleep(x, y):
     sleep = random.uniform(x, y)
     t.sleep(sleep)
+    print(f'Задержка: {sleep}')
 
 
 # крутит число
@@ -28,42 +29,14 @@ def func_one_rotation():
     t.sleep(one_rotation)
     py.keyUp('f')
 
-    print(f'Одна прокрутка заняла {one_rotation}')
-
-
-def one_hundred():
-    i = 0
-    while i < 10:
-        py.press('f')
-        rnd_sleep(0.1, 0.3)
-        py.press('f')
-        func_one_rotation()
-        py.press('f')
-        rnd_sleep(0.1, 0.3)
-        py.press('f')
-        i = i + 1
-        print(f'Внутри def {i * 100}')
-        func_ten()
-
-
-def one_thousand():
-    i = 0
-    while i < 10:
-        py.press('f')
-        func_one_rotation()
-        py.press('f')
-        rnd_sleep(0.1, 0.3)
-        py.press('f')
-        rnd_sleep(0.1, 0.3)
-        py.press('f')
-        i = i + 1
-        print(f'Внутри def{i * 1000}')
+    print(f'Прокрутка 1 цифры заняла {one_rotation}')
 
 
 def func_ten():
     i = 0
     while i < 10:
         func_full_rotation()
+        rnd_sleep(0.1, 0.3)
         py.press('f')
         rnd_sleep(0.1, 0.3)
         py.press('f')
@@ -72,14 +45,42 @@ def func_ten():
         func_one_rotation()
         py.press('f')
         i = i + 1
-        print(f'Внутри def {i}')
+        print(i)
 
 
-def calc():
-    x = 0
-    for n in range(0, 1000):
-        x = x + 10
-        print(x)
+def one_hundred():
+    i = 0
+    while i < 10:
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        func_one_rotation()
+        py.press('f')
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        i = i + 1
+        print(i * 100)
+        func_ten()
+
+
+def one_thousand():
+    i = 0
+    while i < 10:
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        rnd_sleep(0.1, 0.3)
+        func_one_rotation()
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        rnd_sleep(0.1, 0.3)
+        py.press('f')
+        func_ten()
+        one_hundred()
+        i = i + 1
+        print(i * 1000)
 
 
 def timer():
