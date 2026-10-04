@@ -1,144 +1,295 @@
-import time
+"""
+Автоматический перебор комбинаций импульсного замка.
+
+Архитектура (composition root — main()):
+    CrackerConfig       -- неизменяемая конфигурация (данные + валидация)
+    CancellationToken   -- потокобезопасная отмена (Ctrl+1 / Ctrl+C)
+    Logger              -- логирование с таймстампами
+    KeyActor (Protocol) -- абстракция клавиатуры (DIP)
+    PynputKeyActor      -- реализация через pynput
+    LockCracker         -- бизнес-логика перебора (SRP)
+    StopHotkeyListener  -- горячая клавиша остановки (SRP)
+"""
+from __future__ import annotations
+
 import random
-import sys
 import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol
+
 from pynput import keyboard
 
-# ================= КОНФИГУРАЦИЯ =================
-DIGITS_COUNT = 6                    # Количество цифр в замке
-KEY_INTERACT = 'f'                  # Клавиша взаимодействия
 
-FULL_ROTATION_TIME = 5.13           # Полный оборот разряда (10 цифр) за 1 зажатие
-ONE_DIGIT_TIME = FULL_ROTATION_TIME / 10.0  # ~0.513 сек на 1 цифру для переносных разрядов
+# ============================ КОНФИГУРАЦИЯ ============================
 
-START_TEN_BLOCK = 0                 # Начальный блок десятков (0 = 000000..000009)
-DELAY_BETWEEN_ACTIONS = (0.05, 0.1) # Задержка между кликами
-# ================================================
+@dataclass(frozen=True)
+class CrackerConfig:
+    """Неизменяемые параметры брутфорса с валидацией."""
 
-is_running = True
-start_time = None
+    digits_count: int = 6                        # цифр в замке
+    interact_key: str = "f"                      # клавиша взаимодействия
+    full_rotation_time: float = 5.13             # полный оборот разряда (10 цифр)
+    start_block: int = 0                         # начальный блок десятков
+    delay_between_actions: tuple[float, float] = (0.05, 0.1)
+    click_press_time: tuple[float, float] = (0.02, 0.04)
+    countdown_seconds: int = 5
+    stop_hotkey: str = "<ctrl>+1"
 
-def get_ts():
-    """Возвращает метку времени с миллисекундами"""
-    now = datetime.now()
-    elapsed = f"{(time.time() - start_time):.2f}s" if start_time else "0.00s"
-    return f"[{now.strftime('%H:%M:%S')}.{now.microsecond // 1000:03d} | +{elapsed}]"
+    @property
+    def one_digit_time(self) -> float:
+        """Время проворота на 1 цифру (~0.513 с)."""
+        return self.full_rotation_time / 10.0
 
-def stop_script():
-    global is_running
-    print(f"\n{get_ts()} [!] Остановка по Ctrl + 1...")
-    is_running = False
+    @property
+    def total_blocks(self) -> int:
+        """Количество блоков по 10 комбинаций (для 6 цифр = 100 000)."""
+        return 10 ** (self.digits_count - 1)
 
-def start_hotkey_listener():
-    with keyboard.GlobalHotKeys({'<ctrl>+1': stop_script}) as h:
-        h.join()
+    def __post_init__(self) -> None:
+        if self.digits_count < 2:
+            raise ValueError("digits_count должен быть >= 2")
+        if self.full_rotation_time <= 0:
+            raise ValueError("full_rotation_time должен быть > 0")
+        if not 0 <= self.start_block < self.total_blocks:
+            raise ValueError("start_block вне допустимого диапазона")
 
-def sleep_rnd(min_s, max_s):
-    if not is_running:
-        sys.exit(0)
-    time.sleep(random.uniform(min_s, max_s))
 
-def hold_key(key, duration):
-    """Зажатие клавиши с логированием"""
-    if not is_running:
-        sys.exit(0)
-    
-    controller = keyboard.Controller()
-    t_start = time.time()
-    controller.press(key)
-    time.sleep(duration)
-    controller.release(key)
-    t_actual = time.time() - t_start
-    print(f"  {get_ts()} -> [ЗАЖАТИЕ] '{key}' на {t_actual:.3f}сек (план: {duration:.3f}сек)")
+# ============================ ОТМЕНА ОПЕРАЦИИ ============================
 
-def click_key(key):
-    """Одиночный клик клавиши"""
-    if not is_running:
-        sys.exit(0)
-        
-    controller = keyboard.Controller()
-    controller.press(key)
-    time.sleep(random.uniform(0.02, 0.04))
-    controller.release(key)
-    print(f"  {get_ts()} -> [КЛИК] '{key}'")
+class OperationCancelled(Exception):
+    """Сигнал об остановке скрипта (Ctrl+1 или Ctrl+C)."""
 
-def get_code_str(step):
-    return f"{step:0{DIGITS_COUNT}d}"
 
-def calculate_overflow(prev_block, curr_block):
+class CancellationToken:
+    """Потокобезопасный токен отмены (замена глобальной is_running).
+
+    Ожидания прерываются мгновенно при cancel() — даже во время зажатия.
     """
-    Вычисляет, сколько старших разрядов изменилось между блоками десятков
-    Пример: block 0 (00000_) -> block 1 (00001_): глубина 1 (изменился 2-й разряд)
-    Пример: block 9 (00009_) -> block 10 (00010_): глубина 2 (изменились 2-й и 3-й разряды)
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise OperationCancelled()
+
+    def sleep(self, seconds: float) -> None:
+        """Прерываемая пауза: при cancel() немедленно выбрасывает исключение."""
+        if self._event.wait(timeout=seconds):
+            raise OperationCancelled()
+
+
+# ============================ ЛОГИРОВАНИЕ ============================
+
+class Logger:
+    """Консольное логирование с таймстампами (SRP: только вывод)."""
+
+    def __init__(self) -> None:
+        self._start_time: float | None = None
+
+    def start_timer(self) -> None:
+        self._start_time = time.perf_counter()
+
+    def _timestamp(self) -> str:
+        now = datetime.now()
+        elapsed = (
+            f"+{time.perf_counter() - self._start_time:.2f}s"
+            if self._start_time is not None else "+0.00s"
+        )
+        return f"[{now:%H:%M:%S}.{now.microsecond // 1000:03d} | {elapsed}]"
+
+    def info(self, message: str) -> None:
+        print(f"{self._timestamp()} {message}")
+
+    def action(self, message: str) -> None:
+        print(f"  {self._timestamp()} {message}")
+
+    def banner(self, config: CrackerConfig) -> None:
+        print(f"=== БРУТФОРС {config.digits_count}-ЗНАЧНОГО ЗАМКА (ИМПУЛЬСНЫЙ 0-9) ===")
+        print(f"Экстренная остановка: {config.stop_hotkey} или Ctrl+C")
+
+
+# ============================ УПРАВЛЕНИЕ КЛАВИАТУРОЙ ============================
+
+class KeyActor(Protocol):
+    """Абстракция над клавиатурой (инверсия зависимостей).
+
+    Позволяет подменить реальный ввод заглушкой в тестах.
     """
-    prev_str = f"{prev_block:0{DIGITS_COUNT - 1}d}"
-    curr_str = f"{curr_block:0{DIGITS_COUNT - 1}d}"
-    
-    depth = 0
-    for i in range(DIGITS_COUNT - 2, -1, -1):
-        if prev_str[i] == '9' and curr_str[i] == '0':
-            depth += 1
-        else:
-            break
-    return depth + 1
 
-def main():
-    global start_time
-    print(f"=== БРУТФОРС {DIGITS_COUNT}-ЗНАЧНОГО ЗАМКА (ИМПУЛЬСНЫЙ 0-9) ===")
-    print("Экстренная остановка: Ctrl + 1")
-    print("Старт через 5 секунд...")
-    
-    for i in range(5, 0, -1):
-        print(f"{i}...")
-        time.sleep(1)
-        
-    start_time = time.time()
-    print(f"{get_ts()} ПОЕХАЛИ!\n")
+    def click(self, key: str) -> None: ...
+    def hold(self, key: str, duration: float) -> None: ...
 
-    total_blocks = 10**(DIGITS_COUNT - 1) # Всего блоков по 10 цифр (для 6 знаков = 100 000)
 
-    for block in range(START_TEN_BLOCK, total_blocks):
-        if not is_running:
-            break
+class PynputKeyActor:
+    """Реализация KeyActor на pynput. Один контроллер на весь запуск."""
 
-        prefix_code = f"{block:0{DIGITS_COUNT - 1}d}"
-        print(f"{get_ts()} [БЛОК {block + 1}/{total_blocks}] Диапазон: [{prefix_code}0 ... {prefix_code}9]")
+    def __init__(self, config: CrackerConfig, logger: Logger, token: CancellationToken) -> None:
+        self._config = config
+        self._logger = logger
+        self._token = token
+        self._controller = keyboard.Controller()
 
-        # 1. ЕДИНСТВЕННОЕ ЗАЖАТИЕ: Прокручивает весь первый разряд от 0 до 9 за 5.13 сек
-        hold_key(KEY_INTERACT, FULL_ROTATION_TIME)
-        sleep_rnd(*DELAY_BETWEEN_ACTIONS)
+    def click(self, key: str) -> None:
+        self._token.check()
+        self._controller.press(key)
+        try:
+            self._token.sleep(random.uniform(*self._config.click_press_time))
+        finally:
+            self._controller.release(key)
+        self._logger.action(f"[КЛИК] '{key}'")
 
-        # 2. Перенос разряда (происходит в конце каждого блока 0-9)
-        if block < total_blocks - 1:
-            curr_block = block + 1
-            overflow_depth = calculate_overflow(block, curr_block)
+    def hold(self, key: str, duration: float) -> None:
+        self._token.check()
+        started = time.perf_counter()
+        self._controller.press(key)
+        try:
+            self._token.sleep(duration)
+        finally:
+            self._controller.release(key)  # клавиша не «залипнет» при остановке
+        actual = time.perf_counter() - started
+        self._logger.action(f"[ЗАЖАТИЕ] '{key}' на {actual:.3f}сек (план: {duration:.3f}сек)")
 
-            print(f"  {get_ts()} [ДЕБАГ] Смена блока десятков. Глубина переноса: {overflow_depth}")
 
-            # Переходим фокусом к нужному старшему разряду
-            for shift in range(overflow_depth):
-                click_key(KEY_INTERACT)
-                sleep_rnd(*DELAY_BETWEEN_ACTIONS)
+# ============================ БИЗНЕС-ЛОГИКА ============================
 
-            # Проворачиваем старший разряд на +1 цифру
-            hold_key(KEY_INTERACT, ONE_DIGIT_TIME)
-            sleep_rnd(*DELAY_BETWEEN_ACTIONS)
+def calculate_overflow_depth(block: int) -> int:
+    """Глубина переноса при переходе из блока десятков в следующий.
 
-            # Возвращаем фокус на 1-й разряд (дощелкиваем кольцо до конца)
-            remaining_clicks = DIGITS_COUNT - overflow_depth
-            print(f"  {get_ts()} [ДЕБАГ] Возврат фокуса на 1-й разряд ({remaining_clicks} кликов)...")
-            for _ in range(remaining_clicks):
-                click_key(KEY_INTERACT)
-                sleep_rnd(*DELAY_BETWEEN_ACTIONS)
+    Глубина = число «хвостовых» девяток в блоке + 1.
+    Примеры: 0 -> 1 (глубина 1), 9 -> 10 (глубина 2), 99 -> 100 (глубина 3).
+    """
+    depth = 1
+    value = block
+    while value % 10 == 9:
+        depth += 1
+        value //= 10
+    return depth
 
-        sleep_rnd(*DELAY_BETWEEN_ACTIONS)
 
-if __name__ == '__main__':
-    listener_thread = threading.Thread(target=start_hotkey_listener, daemon=True)
-    listener_thread.start()
+class LockCracker:
+    """Алгоритм перебора комбинаций (SRP: только бизнес-логика).
+
+    Ничего не знает о pynput и глобальном состоянии — работает через абстракции.
+    """
+
+    def __init__(self, config: CrackerConfig, keys: KeyActor,
+                 logger: Logger, token: CancellationToken) -> None:
+        self._config = config
+        self._keys = keys
+        self._logger = logger
+        self._token = token
+
+    def run(self) -> None:
+        cfg = self._config
+        for block in range(cfg.start_block, cfg.total_blocks):
+            self._token.check()
+            self._process_block(block)
+            self._pause()
+
+    def _process_block(self, block: int) -> None:
+        cfg = self._config
+        prefix = f"{block:0{cfg.digits_count - 1}d}"
+        self._logger.info(
+            f"[БЛОК {block + 1}/{cfg.total_blocks}] Диапазон: [{prefix}0 ... {prefix}9]"
+        )
+
+        # Единственное зажатие: младший разряд прокручивается 0 -> 9
+        self._keys.hold(cfg.interact_key, cfg.full_rotation_time)
+        self._pause()
+
+        if block + 1 < cfg.total_blocks:
+            self._carry_over(block)
+
+    def _carry_over(self, block: int) -> None:
+        """Перенос разряда и возврат фокуса на младший разряд."""
+        cfg = self._config
+        depth = calculate_overflow_depth(block)
+        self._logger.action(f"[ПЕРЕНОС] Смена блока десятков. Глубина: {depth}")
+
+        self._repeat_clicks(depth)                       # фокус на старший разряд
+        self._keys.hold(cfg.interact_key, cfg.one_digit_time)  # +1 к разряду
+        self._pause()
+
+        remaining = cfg.digits_count - depth
+        self._logger.action(f"[ФОКУС] Возврат на 1-й разряд ({remaining} кликов)")
+        self._repeat_clicks(remaining)
+
+    def _repeat_clicks(self, count: int) -> None:
+        for _ in range(count):
+            self._keys.click(self._config.interact_key)
+            self._pause()
+
+    def _pause(self) -> None:
+        self._token.sleep(random.uniform(*self._config.delay_between_actions))
+
+
+# ============================ ГОРЯЧАЯ КЛАВИША ============================
+
+class StopHotkeyListener:
+    """Фоновый слушатель горячей клавиши остановки (SRP)."""
+
+    def __init__(self, token: CancellationToken, hotkey: str, logger: Logger) -> None:
+        self._token = token
+        self._hotkey = hotkey
+        self._logger = logger
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self._listen, daemon=True, name="stop-hotkey")
+        thread.start()
+        return thread
+
+    def _listen(self) -> None:
+        with keyboard.GlobalHotKeys({self._hotkey: self._on_stop}) as listener:
+            listener.join()
+
+    def _on_stop(self) -> None:
+        if not self._token.cancelled:
+            self._logger.info(f"[!] Остановка по {self._hotkey}...")
+            self._token.cancel()
+
+
+# ============================ ТОЧКА ВХОДА ============================
+
+def _countdown(logger: Logger, token: CancellationToken, seconds: int) -> None:
+    logger.info(f"Старт через {seconds} секунд...")
+    for i in range(seconds, 0, -1):
+        logger.info(f"{i}...")
+        token.sleep(1)
+
+
+def main() -> None:
+    # Композиционный корень: все зависимости собираются в одном месте (DIP)
+    config = CrackerConfig()
+    token = CancellationToken()
+    logger = Logger()
+
+    logger.banner(config)
+    StopHotkeyListener(token, config.stop_hotkey, logger).start()
+
+    keys: KeyActor = PynputKeyActor(config, logger, token)
+    cracker = LockCracker(config, keys, logger, token)
 
     try:
-        main()
+        _countdown(logger, token, config.countdown_seconds)
+        logger.start_timer()
+        logger.info("ПОЕХАЛИ!\n")
+        cracker.run()
+        logger.info("Перебор завершён: все блоки обработаны.")
+    except OperationCancelled:
+        logger.info("Остановлено по запросу пользователя.")
     except KeyboardInterrupt:
-        print("\nЗавершено.")
+        logger.info("\nПрервано Ctrl+C.")
+
+
+if __name__ == "__main__":
+    main()
